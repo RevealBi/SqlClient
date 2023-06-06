@@ -24,5 +24,6 @@
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.Identity.Client" Version="$(MicrosoftIdentityClientVersion)" />
+    <PackageReference Include="SharpCifs.Std" Version="0.2.13" />
   </ItemGroup>
 </Project>
