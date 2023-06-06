@@ -596,6 +596,37 @@ namespace Microsoft.Data.SqlClient
             }
         }
 
+#if NET6_0_OR_GREATER
+        internal TimeOnly TimeOnly
+        {
+            get
+            {
+                ThrowIfNull();
+
+                if (StorageType.Time == _type)
+                {
+                    return new TimeOnly(_value._timeInfo._ticks);
+                }
+
+                return (TimeOnly)Value; // anything else we haven't thought of goes through boxing.
+            }
+        }
+
+        internal DateOnly DateOnly
+        {
+            get
+            {
+                ThrowIfNull();
+
+                if (StorageType.Date == _type)
+                {
+                    return DateOnly.MinValue.AddDays(_value._int32);
+                }
+                return (DateOnly)Value; // anything else we haven't thought of goes through boxing.
+            }
+        }
+#endif
+
         internal DateTimeOffset DateTimeOffset
         {
             get
@@ -624,6 +655,10 @@ namespace Microsoft.Data.SqlClient
             {
                 if (StorageType.SqlBinary == _type)
                 {
+                    if (IsNull)
+                    {
+                        return SqlBinary.Null;
+                    }
                     return (SqlBinary)_object;
                 }
                 return (SqlBinary)SqlValue; // anything else we haven't thought of goes through boxing.
@@ -1093,7 +1128,7 @@ namespace Microsoft.Data.SqlClient
                         return typeof(SqlGuid);
                     case StorageType.SqlXml:
                         return typeof(SqlXml);
-                        // Date DateTime2 and DateTimeOffset have no direct Sql type to contain them
+                        // Time Date DateTime2 and DateTimeOffset have no direct Sql type to contain them
                 }
             }
             else
@@ -1140,6 +1175,10 @@ namespace Microsoft.Data.SqlClient
                         return typeof(DateTime);
                     case StorageType.DateTimeOffset:
                         return typeof(DateTimeOffset);
+#if NET6_0_OR_GREATER
+                    case StorageType.Time:
+                        return typeof(TimeOnly);
+#endif
                 }
             }
 

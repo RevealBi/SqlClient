@@ -3,6 +3,7 @@
 // See the LICENSE file in the project root for more information.
 
 using System;
+using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading.Tasks;
@@ -12,7 +13,7 @@ namespace Microsoft.Data.SqlClient.ManualTesting.Tests
 {
     public static class InstanceNameTest
     {
-        [ConditionalFact(typeof(DataTestUtility), nameof(DataTestUtility.AreConnStringsSetup))]
+        [ConditionalFact(typeof(DataTestUtility), nameof(DataTestUtility.IsNotAzureServer), nameof(DataTestUtility.IsNotAzureSynapse), nameof(DataTestUtility.AreConnStringsSetup))]
         public static void ConnectToSQLWithInstanceNameTest()
         {
             SqlConnectionStringBuilder builder = new(DataTestUtility.TCPConnectionString);
@@ -20,9 +21,9 @@ namespace Microsoft.Data.SqlClient.ManualTesting.Tests
             bool proceed = true;
             string dataSourceStr = builder.DataSource.Replace("tcp:", "");
             string[] serverNamePartsByBackSlash = dataSourceStr.Split('\\');
+            string hostname = serverNamePartsByBackSlash[0];
             if (!dataSourceStr.Contains(",") && serverNamePartsByBackSlash.Length == 2)
             {
-                string hostname = serverNamePartsByBackSlash[0];
                 proceed = !string.IsNullOrWhiteSpace(hostname) && IsBrowserAlive(hostname);
             }
 
@@ -31,6 +32,20 @@ namespace Microsoft.Data.SqlClient.ManualTesting.Tests
                 using SqlConnection connection = new(builder.ConnectionString);
                 connection.Open();
                 connection.Close();
+
+                // We can only connect via IP address if we aren't doing remote Kerberos or strict TLS
+                if (builder.Encrypt != SqlConnectionEncryptOption.Strict &&
+                        (!builder.IntegratedSecurity || hostname.Equals("localhost", StringComparison.OrdinalIgnoreCase) ||
+                         hostname.Equals(Environment.MachineName, StringComparison.OrdinalIgnoreCase)))
+                {
+                    // Exercise the IP address-specific code in SSRP
+                    IPAddress[] addresses = Dns.GetHostAddresses(hostname);
+                    builder.DataSource = builder.DataSource.Replace(hostname, addresses[0].ToString());
+                    builder.TrustServerCertificate = true;
+                    using SqlConnection connection2 = new(builder.ConnectionString);
+                    connection2.Open();
+                    connection2.Close();
+                }
             }
         }
 
@@ -52,7 +67,6 @@ namespace Microsoft.Data.SqlClient.ManualTesting.Tests
             if (IsBrowserAlive(hostname) && IsValidInstance(hostname, instanceName))
             {
                 builder.DataSource = hostname + "\\" + instanceName;
-                
                 using SqlConnection connection = new(builder.ConnectionString);
                 connection.Open();
             }

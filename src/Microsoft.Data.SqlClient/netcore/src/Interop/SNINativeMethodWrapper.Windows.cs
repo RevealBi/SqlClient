@@ -2,11 +2,11 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 // See the LICENSE file in the project root for more information.
 
-using Microsoft.Data.Common;
-using Microsoft.Data.SqlClient;
 using System;
 using System.Runtime.InteropServices;
 using System.Text;
+using Microsoft.Data.Common;
+using Microsoft.Data.SqlClient;
 
 namespace Microsoft.Data.SqlClient
 {
@@ -18,6 +18,8 @@ namespace Microsoft.Data.SqlClient
 
         [UnmanagedFunctionPointer(CallingConvention.StdCall)]
         internal delegate void SqlAsyncCallbackDelegate(IntPtr m_ConsKey, IntPtr pPacket, uint dwError);
+
+        internal delegate IntPtr SqlClientCertificateDelegate(IntPtr pCallbackContext);
 
         internal const int SniIP6AddrStringBufferLength = 48; // from SNI layer
 
@@ -42,6 +44,24 @@ namespace Microsoft.Data.SqlClient
             internal SqlAsyncCallbackDelegate writeDelegate;
             internal IntPtr key;
         }
+
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct AuthProviderInfo
+        {
+            public uint flags;
+            [MarshalAs(UnmanagedType.Bool)]
+            public bool tlsFirst;
+            public object certContext;
+            [MarshalAs(UnmanagedType.LPWStr)]
+            public string certId;
+            [MarshalAs(UnmanagedType.Bool)]
+            public bool certHash;
+            public object clientCertificateCallbackContext;
+            public SqlClientCertificateDelegate clientCertificateCallback;
+            [MarshalAs(UnmanagedType.LPWStr)]
+            public string serverCertFileName;
+        };
+
 
         internal enum ConsumerNumber
         {
@@ -148,6 +168,8 @@ namespace Microsoft.Data.SqlClient
             public Sni_Consumer_Info ConsumerInfo;
             [MarshalAs(UnmanagedType.LPWStr)]
             public string wszConnectionString;
+            [MarshalAs(UnmanagedType.LPWStr)]
+            public string HostNameInCertificate;
             public PrefixEnum networkLibrary;
             public byte* szSPN;
             public uint cchSPN;
@@ -201,6 +223,9 @@ namespace Microsoft.Data.SqlClient
 
         [DllImport(SNI, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SNIAddProviderWrapper")]
         internal static extern uint SNIAddProvider(SNIHandle pConn, ProviderEnum ProvNum, [In] ref uint pInfo);
+
+        [DllImport(SNI, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SNIAddProviderWrapper")]
+        internal static extern uint SNIAddProvider(SNIHandle pConn, ProviderEnum ProvNum, [In] ref AuthProviderInfo pInfo);
 
         [DllImport(SNI, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SNICheckConnectionWrapper")]
         internal static extern uint SNICheckConnection([In] SNIHandle pConn);
@@ -263,7 +288,7 @@ namespace Microsoft.Data.SqlClient
         private static extern uint SNIGetInfoWrapper([In] SNIHandle pConn, SNINativeMethodWrapper.QTypes QType, out ProviderEnum provNum);
 
         [DllImport(SNI, CallingConvention = CallingConvention.Cdecl)]
-        private static extern uint SNIInitialize([In] bool useSystemDefaultSecureProtocols, [In] IntPtr pmo);
+        private static extern uint SNIInitialize([In] IntPtr pmo);
 
         [DllImport(SNI, CallingConvention = CallingConvention.Cdecl)]
         private static extern uint SNIOpenSyncExWrapper(ref SNI_CLIENT_CONSUMER_INFO pClientConsumerInfo, out IntPtr ppConn);
@@ -323,12 +348,12 @@ namespace Microsoft.Data.SqlClient
         {
             return SNIGetInfoWrapper(pConn, QTypes.SNI_QUERY_CONN_CONNID, out connId);
         }
-       
+
         internal static uint SniGetProviderNumber(SNIHandle pConn, ref ProviderEnum provNum)
         {
             return SNIGetInfoWrapper(pConn, QTypes.SNI_QUERY_CONN_PROVIDERNUM, out provNum);
         }
-        
+
         internal static uint SniGetConnectionPort(SNIHandle pConn, ref ushort portNum)
         {
             return SNIGetInfoWrapper(pConn, QTypes.SNI_QUERY_CONN_PEERPORT, out portNum);
@@ -351,7 +376,7 @@ namespace Microsoft.Data.SqlClient
 
         internal static uint SNIInitialize()
         {
-            return SNIInitialize(LocalAppContextSwitches.UseSystemDefaultSecureProtocols, IntPtr.Zero);
+            return SNIInitialize(IntPtr.Zero);
         }
 
         internal static unsafe uint SNIOpenMarsSession(ConsumerInfo consumerInfo, SNIHandle parent, ref IntPtr pConn, bool fSync, SqlConnectionIPAddressPreference ipPreference, SQLDNSInfo cachedDNSInfo)
@@ -369,9 +394,21 @@ namespace Microsoft.Data.SqlClient
             return SNIOpenWrapper(ref native_consumerInfo, "session:", parent, out pConn, fSync, ipPreference, ref native_cachedDNSInfo);
         }
 
-        internal static unsafe uint SNIOpenSyncEx(ConsumerInfo consumerInfo, string constring, ref IntPtr pConn, byte[] spnBuffer, byte[] instanceName, bool fOverrideCache, 
-                                    bool fSync, int timeout, bool fParallel, SqlConnectionIPAddressPreference ipPreference, SQLDNSInfo cachedDNSInfo)
+        internal static unsafe uint SNIOpenSyncEx(
+            ConsumerInfo consumerInfo,
+            string constring,
+            ref IntPtr pConn,
+            byte[] spnBuffer,
+            byte[] instanceName,
+            bool fOverrideCache,
+            bool fSync,
+            int timeout,
+            bool fParallel,
+            SqlConnectionIPAddressPreference ipPreference,
+            SQLDNSInfo cachedDNSInfo,
+            string hostNameInCertificate)
         {
+
             fixed (byte* pin_instanceName = &instanceName[0])
             {
                 SNI_CLIENT_CONSUMER_INFO clientConsumerInfo = new SNI_CLIENT_CONSUMER_INFO();
@@ -380,8 +417,8 @@ namespace Microsoft.Data.SqlClient
                 MarshalConsumerInfo(consumerInfo, ref clientConsumerInfo.ConsumerInfo);
 
                 clientConsumerInfo.wszConnectionString = constring;
+                clientConsumerInfo.HostNameInCertificate = hostNameInCertificate;
                 clientConsumerInfo.networkLibrary = PrefixEnum.UNKNOWN_PREFIX;
-
                 clientConsumerInfo.szInstanceName = pin_instanceName;
                 clientConsumerInfo.cchInstanceName = (uint)instanceName.Length;
                 clientConsumerInfo.fOverrideLastConnectCache = fOverrideCache;

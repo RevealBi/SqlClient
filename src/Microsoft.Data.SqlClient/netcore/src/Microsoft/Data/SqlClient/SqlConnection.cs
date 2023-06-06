@@ -6,7 +6,6 @@ using System;
 using System.Collections;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Data;
 using System.Data.Common;
@@ -14,7 +13,6 @@ using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.IO;
-using System.Linq;
 using System.Reflection;
 using System.Security;
 using System.Threading;
@@ -266,7 +264,11 @@ namespace Microsoft.Data.SqlClient
         /// <returns>Combined list of provider names</returns>
         internal static List<string> GetColumnEncryptionSystemKeyStoreProvidersNames()
         {
-            return s_systemColumnEncryptionKeyStoreProviders.Keys.ToList();
+            if (s_systemColumnEncryptionKeyStoreProviders.Count > 0)
+            {
+                return new List<string>(s_systemColumnEncryptionKeyStoreProviders.Keys);
+            }
+            return new List<string>(0);
         }
 
         /// <summary>
@@ -279,13 +281,13 @@ namespace Microsoft.Data.SqlClient
             if (_customColumnEncryptionKeyStoreProviders is not null &&
                 _customColumnEncryptionKeyStoreProviders.Count > 0)
             {
-                return _customColumnEncryptionKeyStoreProviders.Keys.ToList();
+                return new List<string>(_customColumnEncryptionKeyStoreProviders.Keys);
             }
             if (s_globalCustomColumnEncryptionKeyStoreProviders is not null)
             {
-                return s_globalCustomColumnEncryptionKeyStoreProviders.Keys.ToList();
+                return new List<string>(s_globalCustomColumnEncryptionKeyStoreProviders.Keys);
             }
-            return new List<string>();
+            return new List<string>(0);
         }
 
         /// <summary>
@@ -1414,6 +1416,12 @@ namespace Microsoft.Data.SqlClient
                         if (attempt == retryCount - 1)
                         {
                             SqlClientEventSource.Log.TryTraceEvent("SqlConnection.ReconnectAsync | Info | Original Client Connection Id {0}, give up reconnection", _originalConnectionId);
+                            if (e.Class >= TdsEnums.FATAL_ERROR_CLASS)
+                            {
+                                SqlClientEventSource.Log.TryTraceEvent("<sc.SqlConnection.ReconnectAsync|INFO> Original ClientConnectionID {0} - Fatal Error occured. Error Class: {1}", _originalConnectionId, e.Class);
+                                // Error Class: 20-25, usually terminates the database connection
+                                InnerConnection.CloseConnection(InnerConnection.Owner, ConnectionFactory);
+                            }
                             throw SQL.CR_AllAttemptsFailed(e, _originalConnectionId);
                         }
                         if (timeout > 0 && ADP.TimerRemaining(commandTimeoutExpiration) < ADP.TimerFromSeconds(ConnectRetryInterval))
@@ -1812,7 +1820,35 @@ namespace Microsoft.Data.SqlClient
                 // are not present. Throwing on open with a meaningful message helps identify the issue.
                 if (_cultureCheckState == CultureCheckState.Unknown)
                 {
-                    _cultureCheckState = CultureInfo.GetCultureInfo("en-US").EnglishName.Contains("Invariant") ? CultureCheckState.Invariant : CultureCheckState.Standard;
+                    // check if invariant state has been set by appcontext switch directly 
+                    if (AppContext.TryGetSwitch("System.Globalization.Invariant", out bool isEnabled) && isEnabled)
+                    {
+                        _cultureCheckState = CultureCheckState.Invariant;
+                    }
+                    else
+                    {
+                        // check if invariant state has been set through environment variables
+                        string envValue = Environment.GetEnvironmentVariable("DOTNET_SYSTEM_GLOBALIZATION_INVARIANT");
+                        if (string.Equals(envValue, bool.TrueString, StringComparison.OrdinalIgnoreCase) || string.Equals(envValue, "1", StringComparison.OrdinalIgnoreCase))
+                        {
+                            _cultureCheckState = CultureCheckState.Invariant;
+                        }
+                        else
+                        {
+                            // if it hasn't been manually set it could still apply if the os doesn't have
+                            //  icu libs installed or is a native binary with icu support trimmed away
+                            // netcore 3.1 to net5 do not throw in attempting to create en-us in inariant mode
+                            // net6 and greater will throw so catch and infer invariant mode from the exception
+                            try
+                            {
+                                _cultureCheckState = CultureInfo.GetCultureInfo("en-US").EnglishName.Contains("Invariant") ? CultureCheckState.Invariant : CultureCheckState.Standard;
+                            }
+                            catch (CultureNotFoundException)
+                            {
+                                _cultureCheckState = CultureCheckState.Invariant;
+                            }
+                        }
+                    }
                 }
                 if (_cultureCheckState == CultureCheckState.Invariant)
                 {
@@ -1820,7 +1856,7 @@ namespace Microsoft.Data.SqlClient
                 }
             }
 
-            _applyTransientFaultHandling = (!overrides.HasFlag(SqlConnectionOverrides.OpenWithoutRetry) && retry == null && connectionOptions != null && connectionOptions.ConnectRetryCount > 0);
+            _applyTransientFaultHandling = (!overrides.HasFlag(SqlConnectionOverrides.OpenWithoutRetry) && connectionOptions != null && connectionOptions.ConnectRetryCount > 0);
 
             if (connectionOptions != null &&
                 (connectionOptions.Authentication == SqlAuthenticationMethod.SqlPassword ||
@@ -1849,7 +1885,7 @@ namespace Microsoft.Data.SqlClient
             // does not require GC.KeepAlive(this) because of ReRegisterForFinalize below.
 
             // Set future transient fault handling based on connection options
-            _applyTransientFaultHandling = (retry == null && connectionOptions != null && connectionOptions.ConnectRetryCount > 0);
+            _applyTransientFaultHandling = connectionOptions != null && connectionOptions.ConnectRetryCount > 0;
 
             var tdsInnerConnection = (SqlInternalConnectionTds)InnerConnection;
 
@@ -2195,17 +2231,44 @@ namespace Microsoft.Data.SqlClient
         internal Task<T> RegisterForConnectionCloseNotification<T>(Task<T> outerTask, object value, int tag)
         {
             // Connection exists,  schedule removal, will be added to ref collection after calling ValidateAndReconnect
+
+            object state = null;
+            if (outerTask.AsyncState == this)
+            {
+                // if the caller created the TaskCompletionSource for outerTask with this connection
+                // as the state parameter (which is immutable) we can use task.AsyncState and state
+                // to carry the two pieces of state that we need into the continuation avoiding the
+                // allocation of a new state object to carry them
+                state = value;
+            }
+            else
+            {
+                // otherwise we need to create a Tuple to carry the two pieces of state
+                state = Tuple.Create(this, value);
+            }
+
             return outerTask.ContinueWith(
                 continuationFunction: static (task, state) =>
                 {
-                    Tuple<SqlConnection, object> parameters = (Tuple<SqlConnection, object>)state;
-                    SqlConnection connection = parameters.Item1;
-                    object obj = parameters.Item2;
+                    SqlConnection connection = null;
+                    object obj = null;
+                    if (state is Tuple<SqlConnection, object> tuple)
+                    {
+                        // special state tuple, unpack it
+                        connection = tuple.Item1;
+                        obj = tuple.Item2;
+                    }
+                    else
+                    {
+                        // use state on task and state object
+                        connection = (SqlConnection)task.AsyncState;
+                        obj = state;
+                    }
 
                     connection.RemoveWeakReference(obj);
                     return task;
                 },
-                state: Tuple.Create(this, value),
+                state: state,
                 scheduler: TaskScheduler.Default
            ).Unwrap();
         }

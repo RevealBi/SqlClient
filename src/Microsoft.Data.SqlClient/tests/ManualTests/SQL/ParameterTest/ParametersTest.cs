@@ -223,7 +223,7 @@ namespace Microsoft.Data.SqlClient.ManualTesting.Tests
             var cmd = new SqlCommand("select @foo", conn);
             cmd.Parameters.AddWithValue("@foo", new SqlDecimal(0.5));
             var result = (decimal)cmd.ExecuteScalar();
-            Assert.Equal(result, (decimal)0.5);
+            Assert.Equal((decimal)0.5, result);
         }
 
         // Synapse: Unsupported parameter type found while parsing RPC request. The request has been terminated.
@@ -708,7 +708,7 @@ namespace Microsoft.Data.SqlClient.ManualTesting.Tests
             Assert.Contains("OptimizedParameterBinding", exception.Message);
         }
 
-        [ConditionalFact(typeof(DataTestUtility), nameof(DataTestUtility.AreConnStringsSetup))]
+        [ConditionalFact(typeof(DataTestUtility), nameof(DataTestUtility.AreConnStringsSetup), nameof(DataTestUtility.IsNotAzureSynapse))]
         private static void EnableOptimizedParameterBinding_ReturnSucceeds()
         {
             int firstInput = 12;

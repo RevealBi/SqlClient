@@ -5,7 +5,6 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -48,8 +47,14 @@ namespace Microsoft.Data.SqlClient.SNI
                 }
                 catch (SocketException se)
                 {
+                    // A SocketException is possible for an instance name that doesn't exist.
+                    // If there are multiple IP addresses and one of them fails with a SocketException but
+                    // others simply don't respond because the instance name is invalid, we want to return
+                    // the same error as if the response was empty. The higher error suits all scenarios.
+                    // But log it, just in case there is a different, underlying issue that support needs
+                    // to troubleshoot.
                     SqlClientEventSource.Log.TrySNITraceEvent(nameof(SSRP), EventType.ERR, "SocketException Message = {0}", args0: se?.Message);
-                    throw new Exception(SQLMessage.SqlServerBrowserNotAccessible(), se);
+                    throw;
                 }
 
                 const byte SvrResp = 0x05;
@@ -170,7 +175,16 @@ namespace Microsoft.Data.SqlClient.SNI
                 Debug.Assert(port >= 0 && port <= 65535, "Invalid port");
                 Debug.Assert(requestPacket != null && requestPacket.Length > 0, "requestPacket should not be null or 0-length array");
 
-                bool isIpAddress = IPAddress.TryParse(browserHostname, out IPAddress address);
+                if (IPAddress.TryParse(browserHostname, out IPAddress address))
+                {
+                    SsrpResult response = SendUDPRequest(new IPAddress[] { address }, port, requestPacket, allIPsInParallel);
+                    if (response != null && response.ResponsePacket != null)
+                        return response.ResponsePacket;
+                    else if (response != null && response.Error != null)
+                        throw response.Error;
+                    else
+                        return null;
+                }
 
                 TimeSpan ts = default;
                 // In case the Timeout is Infinite, we will receive the max value of Int64 as the tick count
@@ -181,64 +195,65 @@ namespace Microsoft.Data.SqlClient.SNI
                     ts = ts.Ticks < 0 ? TimeSpan.FromTicks(0) : ts;
                 }
 
-                IPAddress[] ipAddresses = null;
-                if (!isIpAddress)
-                {
-                    Task<IPAddress[]> serverAddrTask = Dns.GetHostAddressesAsync(browserHostname);
-                    bool taskComplete;
-                    try
-                    {
-                        taskComplete = serverAddrTask.Wait(ts);
-                    }
-                    catch (AggregateException ae)
-                    {
-                        throw ae.InnerException;
-                    }
-
-                    // If DNS took too long, need to return instead of blocking
-                    if (!taskComplete)
-                        return null;
-
-                    ipAddresses = serverAddrTask.Result;
-                }
-
+                IPAddress[] ipAddresses = SNICommon.GetDnsIpAddresses(browserHostname);
                 Debug.Assert(ipAddresses.Length > 0, "DNS should throw if zero addresses resolve");
-
+                IPAddress[] ipv4Addresses = null;
+                IPAddress[] ipv6Addresses = null;
                 switch (ipPreference)
                 {
                     case SqlConnectionIPAddressPreference.IPv4First:
                         {
-                            SsrpResult response4 = SendUDPRequest(ipAddresses.Where(i => i.AddressFamily == AddressFamily.InterNetwork).ToArray(), port, requestPacket, allIPsInParallel);
-                            if (response4 != null && response4.ResponsePacket != null)
-                                return response4.ResponsePacket;
+                            SplitIPv4AndIPv6(ipAddresses, out ipv4Addresses, out ipv6Addresses);
 
-                            SsrpResult response6 = SendUDPRequest(ipAddresses.Where(i => i.AddressFamily == AddressFamily.InterNetworkV6).ToArray(), port, requestPacket, allIPsInParallel);
+                            SsrpResult response4 = SendUDPRequest(ipv4Addresses, port, requestPacket, allIPsInParallel);
+                            if (response4 != null && response4.ResponsePacket != null)
+                            {
+                                return response4.ResponsePacket;
+                            }
+
+                            SsrpResult response6 = SendUDPRequest(ipv6Addresses, port, requestPacket, allIPsInParallel);
                             if (response6 != null && response6.ResponsePacket != null)
+                            {
                                 return response6.ResponsePacket;
+                            }
 
                             // No responses so throw first error
                             if (response4 != null && response4.Error != null)
+                            {
                                 throw response4.Error;
+                            }
                             else if (response6 != null && response6.Error != null)
+                            {
                                 throw response6.Error;
+                            }
 
                             break;
                         }
                     case SqlConnectionIPAddressPreference.IPv6First:
                         {
-                            SsrpResult response6 = SendUDPRequest(ipAddresses.Where(i => i.AddressFamily == AddressFamily.InterNetworkV6).ToArray(), port, requestPacket, allIPsInParallel);
-                            if (response6 != null && response6.ResponsePacket != null)
-                                return response6.ResponsePacket;
+                            SplitIPv4AndIPv6(ipAddresses, out ipv4Addresses, out ipv6Addresses);
 
-                            SsrpResult response4 = SendUDPRequest(ipAddresses.Where(i => i.AddressFamily == AddressFamily.InterNetwork).ToArray(), port, requestPacket, allIPsInParallel);
+                            SsrpResult response6 = SendUDPRequest(ipv6Addresses, port, requestPacket, allIPsInParallel);
+                            if (response6 != null && response6.ResponsePacket != null)
+                            {
+                                return response6.ResponsePacket;
+                            }
+
+                            SsrpResult response4 = SendUDPRequest(ipv4Addresses, port, requestPacket, allIPsInParallel);
                             if (response4 != null && response4.ResponsePacket != null)
+                            {
                                 return response4.ResponsePacket;
+                            }
 
                             // No responses so throw first error
                             if (response6 != null && response6.Error != null)
+                            {
                                 throw response6.Error;
+                            }
                             else if (response4 != null && response4.Error != null)
+                            {
                                 throw response4.Error;
+                            }
 
                             break;
                         }
@@ -246,9 +261,13 @@ namespace Microsoft.Data.SqlClient.SNI
                         {
                             SsrpResult response = SendUDPRequest(ipAddresses, port, requestPacket, true); // allIPsInParallel);
                             if (response != null && response.ResponsePacket != null)
+                            {
                                 return response.ResponsePacket;
+                            }
                             else if (response != null && response.Error != null)
+                            {
                                 throw response.Error;
+                            }
 
                             break;
                         }
@@ -278,7 +297,7 @@ namespace Microsoft.Data.SqlClient.SNI
                 for (int i = 0; i < ipAddresses.Length; i++)
                 {
                     IPEndPoint endPoint = new IPEndPoint(ipAddresses[i], port);
-                    tasks.Add(Task.Factory.StartNew<SsrpResult>(() => SendUDPRequest(endPoint, requestPacket)));
+                    tasks.Add(Task.Factory.StartNew<SsrpResult>(() => SendUDPRequest(endPoint, requestPacket), cts.Token));
                 }
 
                 List<Task<SsrpResult>> completedTasks = new();
@@ -332,9 +351,37 @@ namespace Microsoft.Data.SqlClient.SNI
                     }
                 }
             }
+            catch (AggregateException ae)
+            {
+                if (ae.InnerExceptions.Count > 0)
+                {
+                    // Log all errors
+                    foreach (Exception e in ae.InnerExceptions)
+                    {
+                        // Favor SocketException for returned error
+                        if (e is SocketException)
+                        {
+                            result.Error = e;
+                        }
+                        SqlClientEventSource.Log.TrySNITraceEvent(nameof(SSRP), EventType.INFO,
+                            "SendUDPRequest ({0}) resulted in exception: {1}", args0: endPoint.ToString(), args1: e.Message);
+                    }
+
+                    // Return first error if we didn't find a SocketException
+                    result.Error = result.Error == null ? ae.InnerExceptions[0] : result.Error;
+                }
+                else
+                {
+                    result.Error = ae;
+                    SqlClientEventSource.Log.TrySNITraceEvent(nameof(SSRP), EventType.INFO,
+                        "SendUDPRequest ({0}) resulted in exception: {1}", args0: endPoint.ToString(), args1: ae.Message);
+                }
+            }
             catch (Exception e)
             {
                 result.Error = e;
+                SqlClientEventSource.Log.TrySNITraceEvent(nameof(SSRP), EventType.INFO,
+                    "SendUDPRequest ({0}) resulted in exception: {1}", args0: endPoint.ToString(), args1: e.Message);
             }
 
             return result;
@@ -371,7 +418,7 @@ namespace Microsoft.Data.SqlClient.SNI
                             SqlClientEventSource.Log.TrySNITraceEvent(nameof(SSRP), EventType.INFO, "Received instnace info from UDP Client.");
                             if (receiveTask.Result.Buffer.Length < ValidResponseSizeForCLNT_BCAST_EX) //discard invalid response
                             {
-                                response.Append(Encoding.UTF7.GetString(receiveTask.Result.Buffer, ServerResponseHeaderSizeForCLNT_BCAST_EX, receiveTask.Result.Buffer.Length - ServerResponseHeaderSizeForCLNT_BCAST_EX)); //RESP_DATA(VARIABLE) - 3 (RESP_SIZE + SVR_RESP)
+                                response.Append(Encoding.ASCII.GetString(receiveTask.Result.Buffer, ServerResponseHeaderSizeForCLNT_BCAST_EX, receiveTask.Result.Buffer.Length - ServerResponseHeaderSizeForCLNT_BCAST_EX)); //RESP_DATA(VARIABLE) - 3 (RESP_SIZE + SVR_RESP)
                             }
                         }
                     }
@@ -382,6 +429,41 @@ namespace Microsoft.Data.SqlClient.SNI
                 }
             }
             return response.ToString();
+        }
+
+        private static void SplitIPv4AndIPv6(IPAddress[] input, out IPAddress[] ipv4Addresses, out IPAddress[] ipv6Addresses)
+        {
+            ipv4Addresses = Array.Empty<IPAddress>();
+            ipv6Addresses = Array.Empty<IPAddress>();
+
+            if (input != null && input.Length > 0)
+            {
+                List<IPAddress> v4 = new List<IPAddress>(1);
+                List<IPAddress> v6 = new List<IPAddress>(0);
+
+                for (int index = 0; index < input.Length; index++)
+                {
+                    switch (input[index].AddressFamily)
+                    {
+                        case AddressFamily.InterNetwork:
+                            v4.Add(input[index]);
+                            break;
+                        case AddressFamily.InterNetworkV6:
+                            v6.Add(input[index]);
+                            break;
+                    }
+                }
+
+                if (v4.Count > 0)
+                {
+                    ipv4Addresses = v4.ToArray();
+                }
+
+                if (v6.Count > 0)
+                {
+                    ipv6Addresses = v6.ToArray();
+                }
+            }
         }
     }
 }
